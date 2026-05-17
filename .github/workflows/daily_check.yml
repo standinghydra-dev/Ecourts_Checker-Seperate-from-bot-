@@ -1,0 +1,84 @@
+name: eCourts Daily Case Check
+
+on:
+  # ── Scheduled: every day at 10:00 AM IST = 04:30 UTC ─────────────────────
+  schedule:
+    - cron: "30 4 * * *"
+
+  # ── Manual trigger from GitHub Actions UI ─────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (check cases but skip notifications)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      skip_email:
+        description: "Skip email notification"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      skip_telegram:
+        description: "Skip Telegram notification"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  check-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # 2-hour hard cap for the whole job
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ───────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Dependencies ─────────────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Playwright browsers ──────────────────────────────────────────────
+      - name: Install Playwright + Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 5. Tesseract OCR (for CAPTCHA solving) ──────────────────────────────
+      - name: Install Tesseract OCR
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tesseract-ocr
+
+      # ── 6. Run the checker ───────────────────────────────────────────────────
+      # Cases are read from MongoDB (same DB as the Telegram bot).
+      # Status is written back to MongoDB after each run, so change detection
+      # works across runs and stays in sync with the bot — no file cache needed.
+      - name: Run case checker
+        env:
+          MONGODB_URI:        ${{ secrets.MONGODB_URI }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL_SENDER:       ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT:    ${{ secrets.EMAIL_RECIPIENT }}
+        run: |
+          FLAGS=""
+          if [ "${{ github.event.inputs.dry_run }}"       = "true" ]; then FLAGS="$FLAGS --dry-run";  fi
+          if [ "${{ github.event.inputs.skip_email }}"    = "true" ]; then FLAGS="$FLAGS --no-email"; fi
+          if [ "${{ github.event.inputs.skip_telegram }}" = "true" ]; then FLAGS="$FLAGS --no-tg";    fi
+          python run_checker.py $FLAGS
