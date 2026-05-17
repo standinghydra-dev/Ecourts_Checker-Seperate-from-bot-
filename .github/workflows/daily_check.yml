@@ -53,24 +53,25 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # ── 3. Dependencies ─────────────────────────────────────────────────────
+      # ── 3. System deps (Tesseract) ───────────────────────────────────────────
+      # Install before Playwright so apt state is clean.
+      # libasound2t64 is the Ubuntu 24.04 name (libasound2 was renamed).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tesseract-ocr libasound2t64
+
+      # ── 4. Python dependencies ───────────────────────────────────────────────
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Playwright browsers ──────────────────────────────────────────────
-      - name: Install Playwright + Chromium
+      # ── 5. Playwright + Chromium ─────────────────────────────────────────────
+      # playwright>=1.45 knows about Ubuntu 24.04 package renames.
+      - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 
-      # ── 5. Tesseract OCR (for CAPTCHA solving) ──────────────────────────────
-      - name: Install Tesseract OCR
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y tesseract-ocr
-
       # ── 6. Run the checker ───────────────────────────────────────────────────
-      # Cases are read from MongoDB (same DB as the Telegram bot).
-      # Status is written back to MongoDB after each run, so change detection
-      # works across runs and stays in sync with the bot — no file cache needed.
+      # Cases and status are read/written to MongoDB Atlas (shared with the bot).
       - name: Run case checker
         env:
           MONGODB_URI:        ${{ secrets.MONGODB_URI }}
