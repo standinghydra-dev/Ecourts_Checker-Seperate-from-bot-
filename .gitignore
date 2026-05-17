@@ -1,0 +1,23 @@
+# Status persistence (tracked via GitHub Actions cache, not git)
+last_status.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Environment files — NEVER commit secrets
+.env
+.env.local
+
+# Playwright
+.playwright/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
