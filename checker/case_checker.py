@@ -666,6 +666,19 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
                 return result
             else:
                 _log("  ⚠ Page loaded but no case data found — retrying")
+                try:
+                    import os as _os
+                    _os.makedirs("/tmp/debug_no_data", exist_ok=True)
+                    safe_cnr = re.sub(r'[^A-Za-z0-9]', '_', cnr)
+                    page.screenshot(
+                        path=f"/tmp/debug_no_data/{safe_cnr}_attempt{attempt}.png",
+                        full_page=True
+                    )
+                    with open(f"/tmp/debug_no_data/{safe_cnr}_attempt{attempt}.html", "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                    _log(f"  (debug screenshot/html saved for {cnr} attempt {attempt})")
+                except Exception as e:
+                    _log(f"  (debug capture failed: {e})")
                 continue
 
         result["error"] = f"Could not retrieve case after {max_attempts} attempts"
