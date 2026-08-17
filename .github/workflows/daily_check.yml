@@ -86,3 +86,15 @@ jobs:
           if [ "${{ github.event.inputs.skip_email }}"    = "true" ]; then FLAGS="$FLAGS --no-email"; fi
           if [ "${{ github.event.inputs.skip_telegram }}" = "true" ]; then FLAGS="$FLAGS --no-tg";    fi
           python run_checker.py $FLAGS
+
+      # ── 7. Debug artifacts ───────────────────────────────────────────────────
+      # Screenshots/HTML captured whenever a submission loads but no case data
+      # can be parsed — helps diagnose CAPTCHA-rejection wording changes or
+      # results-page structure changes on eCourts' side.
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-no-case-data
+          path: /tmp/debug_no_data/
+          if-no-files-found: ignore
