@@ -15,6 +15,7 @@ Triggered by:
 import os
 import sys
 import json
+import time
 import logging
 import argparse
 import subprocess
@@ -33,6 +34,9 @@ logger = logging.getLogger(__name__)
 ROOT            = Path(__file__).parent
 RUN_CASES_SCRIPT = ROOT / "checker" / "run_cases.py"
 TIMEOUT_PER_CASE = 300   # 5-minute hard kill per case (same as original)
+DELAY_BETWEEN_CASES = 8  # seconds — spaces out requests to eCourts to reduce
+                          # rate-limit / "Search Page not Found" errors seen
+                          # when many fresh sessions hit them back-to-back
 
 # ── Imports (after path setup) ────────────────────────────────────────────────
 sys.path.insert(0, str(ROOT))
@@ -160,6 +164,9 @@ def main():
             result.get("case_status", result.get("error", "?")),
             result.get("next_hearing", "—"),
         )
+
+        if i < len(cases):
+            time.sleep(DELAY_BETWEEN_CASES)
 
     logger.info("=" * 60)
     logger.info(
