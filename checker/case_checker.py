@@ -89,7 +89,9 @@ def solve_captcha(img_bytes: bytes, logger=None) -> str:
                             if logger:
                                 logger(f"  OCR candidates: {dict(counts)} → chose '{text}' (early exit)")
                             return text
-                except Exception:
+                except Exception as e:
+                    if logger:
+                        logger(f"  OCR attempt error (scale={scale}, threshold={threshold}): {e}")
                     continue
 
         if not counts:
@@ -303,6 +305,28 @@ def fetch_history_details(page, max_entries: int = 2, logger=None) -> list:
 
 
 # ── Main case fetcher ─────────────────────────────────────────────────────────
+# ── Server-side error-page detection ────────────────────────────────────────
+# eCourts intermittently serves a blank page containing only this banner
+# instead of the real CNR search form — observed after repeated requests in
+# a short window (looks like a rate-limit / session throttle on their end).
+# When this happens there is no CNR input to find at all, so the old code's
+# immediate "Cannot find CNR input field on page" failure was really this in
+# disguise — it gave up on attempt 1 instead of using the retry budget.
+def _looks_like_error_page(page_text: str) -> bool:
+    lp = (page_text or "").lower()
+    return "search page not found" in lp or "welcome user" in lp
+
+
+def _reload_ecourts(page, _log):
+    page.goto(ECOURTS_URL, wait_until="domcontentloaded", timeout=30000)
+    time.sleep(1.5)
+    try:
+        page.click("text=CNR Number", timeout=5000)
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+
 def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
                detailed: bool = False) -> dict:
     """
@@ -348,8 +372,26 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
 
             cnr_el, cnr_sel = _find_input(page, CNR_SELECTORS, timeout_ms=8000)
             if not cnr_el:
-                result["error"] = "Cannot find CNR input field on page"
-                return result
+                page_text_now = ""
+                try:
+                    page_text_now = page.inner_text("body", timeout=5000) or ""
+                except Exception:
+                    pass
+
+                if _looks_like_error_page(page_text_now):
+                    _log(f"  ⚠ eCourts served 'Search Page not Found' error page (attempt {attempt}/{max_attempts})")
+                else:
+                    _log(f"  ⚠ CNR input not found, page may not have loaded fully (attempt {attempt}/{max_attempts})")
+
+                if attempt == max_attempts:
+                    result["error"] = "Cannot find CNR input field on page (after all retries)"
+                    return result
+
+                backoff = min(5 * attempt, 30)  # 5s, 10s, 15s... capped at 30s
+                _log(f"  Backing off {backoff}s before retry...")
+                time.sleep(backoff)
+                _reload_ecourts(page, _log)
+                continue
 
             _log(f"  Found CNR input: {cnr_sel}")
             _fill_field(page, cnr_el, cnr.strip())
