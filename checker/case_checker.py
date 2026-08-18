@@ -317,6 +317,34 @@ def _looks_like_error_page(page_text: str) -> bool:
     return "search page not found" in lp or "welcome user" in lp
 
 
+def _safe_close(browser, timeout: float = 10.0):
+    """
+    browser.close() can hang indefinitely if Chromium is unresponsive
+    (e.g. right after a SIGALRM interrupted it mid-navigation). Run it in
+    a background thread with a join timeout so cleanup can never block
+    the whole process past the external kill window -- if it doesn't
+    finish in time we just move on; the OS-level timeout/SIGKILL wrapper
+    around this whole subprocess is the final backstop either way.
+    """
+    import threading
+    t = threading.Thread(target=lambda: _try(browser.close), daemon=True)
+    t.start()
+    t.join(timeout)
+
+
+def _try(fn):
+    try:
+        fn()
+    except Exception:
+        pass
+
+
+_MAX_ERROR_PAGE_RETRIES = 2  # fail fast — this block is sticky within a
+                              # session but usually clears on the next case's
+                              # fresh subprocess, so don't burn the full
+                              # attempt/backoff budget chasing it here.
+
+
 def _reload_ecourts(page, _log):
     page.goto(ECOURTS_URL, wait_until="domcontentloaded", timeout=30000)
     time.sleep(1.5)
@@ -351,6 +379,7 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
         except Exception:
             pass
 
+        error_page_hits = 0
         for attempt in range(1, max_attempts + 1):
             _log(f"  ── Attempt {attempt}/{max_attempts} at {datetime.now().strftime('%H:%M:%S')} ──")
 
@@ -379,17 +408,30 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
                     pass
 
                 if _looks_like_error_page(page_text_now):
-                    _log(f"  ⚠ eCourts served 'Search Page not Found' error page (attempt {attempt}/{max_attempts})")
-                else:
-                    _log(f"  ⚠ CNR input not found, page may not have loaded fully (attempt {attempt}/{max_attempts})")
+                    error_page_hits += 1
+                    _log(f"  ⚠ eCourts served 'Search Page not Found' error page "
+                         f"(hit {error_page_hits}/{_MAX_ERROR_PAGE_RETRIES})")
 
+                    # This block tends to be sticky for the rest of THIS case's
+                    # session (same browser/cookies) but often clears on the
+                    # next case's fresh subprocess/session. Retrying heavily
+                    # here mostly burns time and risks colliding with the
+                    # 280s SIGALRM kill mid-navigation. Fail fast instead.
+                    if error_page_hits >= _MAX_ERROR_PAGE_RETRIES:
+                        result["error"] = "eCourts blocked this session (Search Page not Found)"
+                        return result
+
+                    backoff = 5 * error_page_hits  # 5s, then 10s
+                    _log(f"  Backing off {backoff}s before retry...")
+                    time.sleep(backoff)
+                    _reload_ecourts(page, _log)
+                    continue
+
+                _log(f"  ⚠ CNR input not found, page may not have loaded fully (attempt {attempt}/{max_attempts})")
                 if attempt == max_attempts:
                     result["error"] = "Cannot find CNR input field on page (after all retries)"
                     return result
-
-                backoff = min(5 * attempt, 30)  # 5s, 10s, 15s... capped at 30s
-                _log(f"  Backing off {backoff}s before retry...")
-                time.sleep(backoff)
+                time.sleep(3)
                 _reload_ecourts(page, _log)
                 continue
 
@@ -507,7 +549,16 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
             except Exception:
                 _log("  Timed out waiting for page load — reading page anyway")
 
-            time.sleep(1)
+            # The case-details table is often injected by a separate AJAX call
+            # AFTER domcontentloaded fires. A flat 1s sleep wasn't enough time
+            # for that under GitHub Actions' network latency to eCourts (it was
+            # fine locally, but not from GH Actions) -- wait for network activity
+            # to actually settle first, then still pad with a short sleep.
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            time.sleep(2)
 
             page_text = ""
             try:
@@ -770,10 +821,7 @@ def run_all_cases(cases: list, last_status: dict,
         for i, case in enumerate(cases):
             # Recycle browser every N cases to free accumulated memory
             if i > 0 and i % _BROWSER_RECYCLE_EVERY == 0:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                _safe_close(browser)
                 browser, page = _make_browser_and_page(p)
                 _log(f"♻️  Browser recycled at case {i+1}/{len(cases)}")
 
@@ -798,10 +846,7 @@ def run_all_cases(cases: list, last_status: dict,
                 # Browser may be in bad/frozen state after an exception.
                 # Restart it so the next case gets a clean instance.
                 _log(f"  ♻️  Restarting browser after error")
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                _safe_close(browser)
                 try:
                     browser, page = _make_browser_and_page(p)
                 except Exception as be:
@@ -822,9 +867,6 @@ def run_all_cases(cases: list, last_status: dict,
             new_status[cnr] = current_key
             _log(f"  ✔ Done with {label} at {datetime.now().strftime('%H:%M:%S')}")
 
-        try:
-            browser.close()
-        except Exception:
-            pass
+        _safe_close(browser)
 
     return results, changes, new_status
