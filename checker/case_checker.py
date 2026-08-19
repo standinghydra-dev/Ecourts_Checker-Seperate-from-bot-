@@ -304,7 +304,6 @@ def fetch_history_details(page, max_entries: int = 2, logger=None) -> list:
     return entries
 
 
-# ── Main case fetcher ─────────────────────────────────────────────────────────
 # ── Server-side error-page detection ────────────────────────────────────────
 # eCourts intermittently serves a blank page containing only this banner
 # instead of the real CNR search form — observed after repeated requests in
@@ -317,24 +316,18 @@ def _looks_like_error_page(page_text: str) -> bool:
     return "search page not found" in lp or "welcome user" in lp
 
 
-def _safe_close(browser, timeout: float = 10.0):
+def _safe_close(browser):
     """
-    browser.close() can hang indefinitely if Chromium is unresponsive
-    (e.g. right after a SIGALRM interrupted it mid-navigation). Run it in
-    a background thread with a join timeout so cleanup can never block
-    the whole process past the external kill window -- if it doesn't
-    finish in time we just move on; the OS-level timeout/SIGKILL wrapper
-    around this whole subprocess is the final backstop either way.
+    Playwright's sync API is NOT thread-safe (it's built on greenlets tied to
+    the calling thread), so browser.close() must be called directly from the
+    same thread rather than via a background thread -- that approach caused
+    'cannot switch to a different thread' greenlet errors. The retry cap on
+    the error-page block (_MAX_ERROR_PAGE_RETRIES) is what actually keeps
+    close() from being called on a badly-hung browser near the 280s mark;
+    this is just a plain, safe wrapper.
     """
-    import threading
-    t = threading.Thread(target=lambda: _try(browser.close), daemon=True)
-    t.start()
-    t.join(timeout)
-
-
-def _try(fn):
     try:
-        fn()
+        browser.close()
     except Exception:
         pass
 
@@ -549,16 +542,21 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
             except Exception:
                 _log("  Timed out waiting for page load — reading page anyway")
 
-            # The case-details table is often injected by a separate AJAX call
-            # AFTER domcontentloaded fires. A flat 1s sleep wasn't enough time
-            # for that under GitHub Actions' network latency to eCourts (it was
-            # fine locally, but not from GH Actions) -- wait for network activity
-            # to actually settle first, then still pad with a short sleep.
+            # Confirmed via debug screenshots: eCourts shows a "Loading..."
+            # modal spinner while it fetches case details via AJAX AFTER
+            # domcontentloaded fires -- and it was still stuck on screen
+            # even after a 20s wait in production. Give it more room and
+            # log how long it actually took, so we know whether it's just
+            # slow or genuinely never resolves for automated sessions.
+            _spinner_start = time.time()
             try:
-                page.wait_for_load_state("networkidle", timeout=8000)
+                page.wait_for_selector("text=Loading...", state="hidden", timeout=40000)
+                _elapsed = time.time() - _spinner_start
+                if _elapsed > 1:
+                    _log(f"  Loading spinner cleared after {_elapsed:.1f}s")
             except Exception:
-                pass
-            time.sleep(2)
+                _log("  ⚠ 'Loading...' spinner never cleared after 40s — reading page anyway")
+            time.sleep(1)
 
             page_text = ""
             try:
