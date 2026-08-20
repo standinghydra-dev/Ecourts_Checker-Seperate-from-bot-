@@ -10,15 +10,22 @@ Usage:
 Triggered by:
   - GitHub Actions (scheduled or manual via workflow_dispatch)
   - Locally: just run the script
+
+NOTE ON ARCHITECTURE: all cases now run in ONE shared browser session
+within this single process (checker.case_checker.run_all_cases), instead
+of the old model that spawned a fresh subprocess+browser per case. This
+was changed because eCourts appears to rate-limit/block based on how many
+distinct "fresh session" requests hit it in a short window -- a shared
+session with spacing between cases avoids that far more reliably. See
+checker/case_checker.py's run_all_cases() docstring for the safety nets
+that replace the old per-case OS-level subprocess timeout.
 """
 
 import os
 import sys
 import json
-import time
 import logging
 import argparse
-import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -31,76 +38,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT            = Path(__file__).parent
-RUN_CASES_SCRIPT = ROOT / "checker" / "run_cases.py"
-TIMEOUT_PER_CASE = 300   # 5-minute hard kill per case (same as original)
-DELAY_BETWEEN_CASES = 8  # seconds — spaces out requests to eCourts to reduce
-                          # rate-limit / "Search Page not Found" errors seen
-                          # when many fresh sessions hit them back-to-back
+ROOT = Path(__file__).parent
+DELAY_BETWEEN_CASES = 8    # seconds between cases within the shared session
+PER_CASE_TIMEOUT    = 200  # hard wall-clock cap per case (POSIX only)
 
 # ── Imports (after path setup) ────────────────────────────────────────────────
 sys.path.insert(0, str(ROOT))
 from storage  import load_cases, update_status
 from notifier import notify
-
-
-# ── Per-case subprocess runner (identical logic to original scraper.py) ────────
-
-def _run_one_case(case: dict, last_status: dict) -> dict:
-    """Spawn run_cases.py for a single case with a hard 5-min timeout."""
-    payload = json.dumps(
-        {"case": case, "last_status": last_status, "detailed": True},
-        ensure_ascii=False,
-    )
-    cnr   = case.get("cnr", "?")
-    label = case.get("label", cnr)
-
-    proc = subprocess.Popen(
-        ["timeout", "-k", "10", str(TIMEOUT_PER_CASE),
-         sys.executable, str(RUN_CASES_SCRIPT)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=None,   # inherit: live logs in terminal / Actions log
-        text=True,
-    )
-
-    stdout_data = ""
-    try:
-        stdout_data, _ = proc.communicate(
-            input=payload,
-            timeout=TIMEOUT_PER_CASE + 60,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("communicate() backup timeout for '%s' — force killing", label)
-        proc.kill()
-        try:
-            proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-    except Exception as e:
-        logger.error("communicate() error for '%s': %s", label, e)
-
-    if proc.returncode in (124, -15, -9):
-        logger.error("Case '%s' killed after %ds — Chromium froze", label, TIMEOUT_PER_CASE)
-        return {
-            "cnr": cnr, "label": label, "raw_ok": False,
-            "error": f"Killed after {TIMEOUT_PER_CASE}s — Chromium froze",
-            "last_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-
-    try:
-        output = json.loads(stdout_data)
-        return output.get("result", {
-            "cnr": cnr, "label": label, "raw_ok": False,
-            "error": "Empty result from subprocess",
-        })
-    except Exception as e:
-        logger.error("Failed to parse result for '%s': %s", label, e)
-        return {
-            "cnr": cnr, "label": label, "raw_ok": False,
-            "error": "Result parse failed",
-            "last_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
+from checker.case_checker import run_all_cases
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -149,24 +95,13 @@ def main():
         for cnr, data in old_status.items()
     }
 
-    results = []
-    for i, case in enumerate(cases, 1):
-        label = case.get("label", case.get("cnr", "?"))
-        logger.info("[%d/%d] Checking: %s (%s)", i, len(cases), label, case.get("cnr", "?"))
-        result = _run_one_case(case, last_status)
-        if "label" not in result:
-            result["label"] = label
-        results.append(result)
-        ok = "✅" if result.get("raw_ok") else "❌"
-        logger.info(
-            "  %s %s | Stage: %s | Next: %s",
-            ok, label,
-            result.get("case_status", result.get("error", "?")),
-            result.get("next_hearing", "—"),
-        )
-
-        if i < len(cases):
-            time.sleep(DELAY_BETWEEN_CASES)
+    results, changes_from_run, _ = run_all_cases(
+        cases, last_status,
+        logger=logger.info,
+        detailed=True,
+        delay_between_cases=DELAY_BETWEEN_CASES,
+        per_case_timeout=PER_CASE_TIMEOUT,
+    )
 
     logger.info("=" * 60)
     logger.info(
@@ -174,7 +109,9 @@ def main():
         sum(1 for r in results if r.get("raw_ok")), len(results)
     )
 
-    # Persist status and get changes
+    # Persist status and get the official changes list (storage.py owns the
+    # persisted "last known status" — run_all_cases' own change detection
+    # above is only used for its ⚡ log lines during the run)
     changes = update_status(results)
     if changes:
         logger.info("Changes detected: %s", ", ".join(changes))
