@@ -98,3 +98,15 @@ jobs:
           name: debug-no-case-data
           path: /tmp/debug_no_data/
           if-no-files-found: ignore
+
+      # ── 8. Error-page diagnostics ────────────────────────────────────────────
+      # HTTP status/headers + automation-fingerprint signals (navigator.webdriver
+      # etc.) captured every time eCourts serves the "Search Page not Found"
+      # error, to identify the actual mechanism instead of guessing.
+      - name: Upload error-page diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-error-page
+          path: /tmp/debug_error_page/
+          if-no-files-found: ignore
