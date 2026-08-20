@@ -11,12 +11,54 @@ import re
 import sys
 import time
 import json
+import signal
 import platform
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ── Per-case hard timeout (POSIX only — signal.alarm doesn't exist on
+# Windows, and this module is also used for local Windows testing, so this
+# must degrade gracefully there instead of crashing on import/use) ─────────
+_HAS_ALARM = hasattr(signal, "alarm")
+
+
+class _CaseTimeout(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise _CaseTimeout()
+
+
+class case_time_limit:
+    """
+    Context manager enforcing a hard wall-clock limit on a single case,
+    now that cases run in one continuous process/browser session instead
+    of isolated subprocesses (which used to get an OS-level `timeout` kill
+    as a backstop). On POSIX this uses SIGALRM, the same mechanism the old
+    subprocess wrapper relied on internally. On Windows (no SIGALRM) this
+    is a no-op — local testing already relies on Playwright's own
+    page.set_default_timeout() safety net instead.
+    """
+    def __init__(self, seconds: int):
+        self.seconds = seconds
+        self._prev_handler = None
+
+    def __enter__(self):
+        if _HAS_ALARM:
+            self._prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(self.seconds)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if _HAS_ALARM:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self._prev_handler)
+        return False
+
 
 # ── OCR setup ─────────────────────────────────────────────────────────────────
 try:
@@ -338,14 +380,88 @@ _MAX_ERROR_PAGE_RETRIES = 2  # fail fast — this block is sticky within a
                               # attempt/backoff budget chasing it here.
 
 
+def _capture_error_page_diagnostics(page, cnr: str, hit_number: int, _log,
+                                     nav_status=None, nav_headers=None):
+    """
+    Captures the actual evidence needed to identify WHY eCourts is serving
+    the error page, instead of continuing to guess. Things we've never
+    actually checked before:
+      1. The real HTTP status code + response headers of the last
+         navigation (was this a WAF block, a 403/429, or a normal 200 with
+         a "not found" app-level view? Very different root causes).
+      2. Automation-fingerprint signals a bot-detection script would see
+         (navigator.webdriver is the big one -- Playwright sets this true
+         by default, which is one of the most common things sites check
+         for, completely independent of request frequency/patterns).
+    Writes one JSON file per occurrence to /tmp/debug_error_page/.
+    """
+    import os as _os
+    diag = {
+        "cnr": cnr,
+        "hit_number": hit_number,
+        "nav_status": nav_status,
+        "nav_headers": nav_headers or {},
+    }
+
+    try:
+        diag["url"] = page.url
+    except Exception as e:
+        diag["url_error"] = str(e)
+
+    try:
+        fingerprint = page.evaluate("""
+            () => ({
+                webdriver: navigator.webdriver,
+                userAgent: navigator.userAgent,
+                languages: navigator.languages,
+                pluginsLength: navigator.plugins ? navigator.plugins.length : null,
+                hasChrome: typeof window.chrome !== 'undefined',
+                cookiesEnabled: navigator.cookieEnabled,
+                cookieString: document.cookie,
+            })
+        """)
+        diag["fingerprint"] = fingerprint
+    except Exception as e:
+        diag["fingerprint_error"] = str(e)
+
+    try:
+        cookies = page.context.cookies()
+        diag["context_cookies"] = [
+            {"name": c["name"], "domain": c["domain"]} for c in cookies
+        ]
+    except Exception as e:
+        diag["cookies_error"] = str(e)
+
+    try:
+        _os.makedirs("/tmp/debug_error_page", exist_ok=True)
+        safe_cnr = re.sub(r'[^A-Za-z0-9]', '_', cnr)
+        path = f"/tmp/debug_error_page/{safe_cnr}_hit{hit_number}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(diag, f, indent=2, default=str)
+        _log(f"  (error-page diagnostics saved: status={nav_status}, "
+             f"navigator.webdriver={diag.get('fingerprint', {}).get('webdriver')}, "
+             f"cookies={len(diag.get('context_cookies', []))})")
+    except Exception as e:
+        _log(f"  (diagnostic capture failed: {e})")
+
+
+
 def _reload_ecourts(page, _log):
-    page.goto(ECOURTS_URL, wait_until="domcontentloaded", timeout=30000)
+    """Returns (status, headers_dict) of the navigation response, or (None, {}) on failure."""
+    try:
+        resp = page.goto(ECOURTS_URL, wait_until="load", timeout=30000)
+        status = resp.status if resp else None
+        headers = dict(resp.headers) if resp else {}
+    except Exception as e:
+        _log(f"  (reload navigation error: {e})")
+        status, headers = None, {}
     time.sleep(1.5)
     try:
         page.click("text=CNR Number", timeout=5000)
         time.sleep(0.5)
     except Exception:
         pass
+    return status, headers
 
 
 def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
@@ -363,7 +479,14 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
 
     try:
         _log("  Loading eCourts...")
-        page.goto(ECOURTS_URL, wait_until="domcontentloaded", timeout=30000)
+        last_nav_status = None
+        last_nav_headers = {}
+        try:
+            _resp = page.goto(ECOURTS_URL, wait_until="load", timeout=30000)
+            last_nav_status = _resp.status if _resp else None
+            last_nav_headers = dict(_resp.headers) if _resp else {}
+        except Exception as e:
+            _log(f"  (initial navigation error: {e})")
         time.sleep(1.5)
 
         try:
@@ -404,6 +527,10 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
                     error_page_hits += 1
                     _log(f"  ⚠ eCourts served 'Search Page not Found' error page "
                          f"(hit {error_page_hits}/{_MAX_ERROR_PAGE_RETRIES})")
+                    _capture_error_page_diagnostics(
+                        page, cnr, error_page_hits, _log,
+                        nav_status=last_nav_status, nav_headers=last_nav_headers
+                    )
 
                     # This block tends to be sticky for the rest of THIS case's
                     # session (same browser/cookies) but often clears on the
@@ -417,7 +544,7 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
                     backoff = 5 * error_page_hits  # 5s, then 10s
                     _log(f"  Backing off {backoff}s before retry...")
                     time.sleep(backoff)
-                    _reload_ecourts(page, _log)
+                    last_nav_status, last_nav_headers = _reload_ecourts(page, _log)
                     continue
 
                 _log(f"  ⚠ CNR input not found, page may not have loaded fully (attempt {attempt}/{max_attempts})")
@@ -425,7 +552,7 @@ def fetch_case(page, cnr: str, logger=None, max_attempts: int = 5,
                     result["error"] = "Cannot find CNR input field on page (after all retries)"
                     return result
                 time.sleep(3)
-                _reload_ecourts(page, _log)
+                last_nav_status, last_nav_headers = _reload_ecourts(page, _log)
                 continue
 
             _log(f"  Found CNR input: {cnr_sel}")
@@ -797,14 +924,28 @@ def _make_browser_and_page(playwright_instance):
 
 def run_all_cases(cases: list, last_status: dict,
                   logger=None,
-                  detailed: bool = False) -> tuple:
+                  detailed: bool = False,
+                  delay_between_cases: int = 8,
+                  per_case_timeout: int = 200) -> tuple:
     """
-    Run fetch_case for all cases. Returns (results, changes, new_status).
+    Run fetch_case for all cases in ONE shared browser session (no more
+    subprocess-per-case). Returns (results, changes, new_status).
+
+    Safety nets, since we no longer have an OS-level `timeout` wrapper per
+    case to fall back on:
+      - per_case_timeout via case_time_limit (SIGALRM on POSIX / no-op on
+        Windows) bounds how long any single case can run.
+      - On timeout or any exception, the browser is restarted, itself
+        bounded by a short inner case_time_limit so a truly frozen
+        Chromium can't hang the restart attempt forever.
+      - If the restart ALSO fails/hangs, we stop processing further cases
+        (rather than risk hanging the whole job past the 120-minute GH
+        Actions limit with zero results delivered) and mark the remaining
+        cases as skipped, so run_checker.py can still notify with whatever
+        was collected so far.
 
     Recycles the Chromium browser every _BROWSER_RECYCLE_EVERY cases to
-    prevent memory exhaustion on long 'check all' runs. Also restarts the
-    browser after any exception — a frozen/errored Chromium may still be in
-    bad state and poison subsequent cases.
+    prevent memory exhaustion on long 'check all' runs.
     page.set_default_timeout(30000) acts as a safety net for ALL CDP ops.
     """
     _log = logger or print
@@ -815,8 +956,26 @@ def run_all_cases(cases: list, last_status: dict,
     with sync_playwright() as p:
         browser, page = _make_browser_and_page(p)
         _log(f"Browser started (will recycle every {_BROWSER_RECYCLE_EVERY} cases)")
+        if not _HAS_ALARM:
+            _log("  (Windows detected — hard per-case timeout disabled, "
+                 "relying on Playwright's own operation timeouts)")
+
+        browser_unrecoverable = False
 
         for i, case in enumerate(cases):
+            if browser_unrecoverable:
+                cnr   = case["cnr"]
+                label = case.get("label", cnr)
+                _log(f"  ⏭  Skipping {label} — browser unrecoverable earlier in this run")
+                result = {
+                    "cnr": cnr, "label": label, "raw_ok": False,
+                    "error": "Skipped — browser became unrecoverable earlier in this run",
+                    "last_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+                results.append(result)
+                new_status[cnr] = last_status.get(cnr, "")
+                continue
+
             # Recycle browser every N cases to free accumulated memory
             if i > 0 and i % _BROWSER_RECYCLE_EVERY == 0:
                 _safe_close(browser)
@@ -829,10 +988,21 @@ def run_all_cases(cases: list, last_status: dict,
             _log(f"  ⏱ Started at {datetime.now().strftime('%H:%M:%S')}")
 
             try:
-                result = fetch_case(
-                    page, cnr,
-                    logger=_log, detailed=detailed
-                )
+                with case_time_limit(per_case_timeout):
+                    result = fetch_case(
+                        page, cnr,
+                        logger=_log, detailed=detailed
+                    )
+            except _CaseTimeout:
+                _log(f"  ⏰ Case exceeded {per_case_timeout}s — treating as failed")
+                result = {
+                    "cnr": cnr, "label": label, "raw_ok": False,
+                    "error": f"Case exceeded {per_case_timeout}s",
+                    "last_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+                browser, page, restart_ok = _restart_browser_bounded(p, browser, _log)
+                if not restart_ok:
+                    browser_unrecoverable = True
             except Exception as e:
                 _log(f"  ❌ Exception for {label}: {e}")
                 result = {
@@ -841,14 +1011,9 @@ def run_all_cases(cases: list, last_status: dict,
                     "error": str(e)[:200],
                     "last_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 }
-                # Browser may be in bad/frozen state after an exception.
-                # Restart it so the next case gets a clean instance.
-                _log(f"  ♻️  Restarting browser after error")
-                _safe_close(browser)
-                try:
-                    browser, page = _make_browser_and_page(p)
-                except Exception as be:
-                    _log(f"  ❌ Could not restart browser: {be}")
+                browser, page, restart_ok = _restart_browser_bounded(p, browser, _log)
+                if not restart_ok:
+                    browser_unrecoverable = True
 
             result["label"] = label
             results.append(result)
@@ -865,6 +1030,31 @@ def run_all_cases(cases: list, last_status: dict,
             new_status[cnr] = current_key
             _log(f"  ✔ Done with {label} at {datetime.now().strftime('%H:%M:%S')}")
 
-        _safe_close(browser)
+            if not browser_unrecoverable and i < len(cases) - 1:
+                time.sleep(delay_between_cases)
+
+        if not browser_unrecoverable:
+            _safe_close(browser)
 
     return results, changes, new_status
+
+
+def _restart_browser_bounded(p, old_browser, _log):
+    """
+    Attempts to close + relaunch the browser, bounded by a short inner
+    timeout so a truly frozen Chromium can't hang this indefinitely.
+    Returns (browser, page, ok) — ok=False means even the restart itself
+    failed/hung, signaling the caller to stop processing further cases.
+    """
+    _log("  ♻️  Restarting browser after error")
+    try:
+        with case_time_limit(20):
+            _safe_close(old_browser)
+            browser, page = _make_browser_and_page(p)
+        return browser, page, True
+    except _CaseTimeout:
+        _log("  ❌ Browser restart itself timed out — browser may be unrecoverable")
+        return old_browser, None, False
+    except Exception as be:
+        _log(f"  ❌ Could not restart browser: {be}")
+        return old_browser, None, False
